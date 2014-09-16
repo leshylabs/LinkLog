@@ -1,0 +1,467 @@
+#!/usr/bin/env perl
+
+################################################################################
+# LinkLog - Log Viewer Utility for Linksys Routers
+# Copyright (c) 2014, Leshy Labs LLC
+# All rights reserved.
+################################################################################
+# For the latest version of the progarm:
+#    https://github.com/leshylabs/LinkLog
+#
+# For more information about this program and its usage:
+#    http://www.leshylabs.com/blog/dev/2014-09-16-Capturing_Linksys_Logviewer_Events_in_Linux.html
+################################################################################
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above
+#       copyright notice, this list of conditions and the following
+#       disclaimer in the documentation and/or other materials provided
+#       with the distribution.
+#     * The names names of the authors may not be used to endorse or
+#       promote products derived from this software without specific
+#       prior written permission.
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND ITS
+# CONTRIBUTERS ''AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES,
+# INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR ITS
+# CONTRIBUTERS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+# USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+# OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+################################################################################
+
+use Socket;
+use IO::Socket;
+use Getopt::Long;
+use POSIX;
+use sigtrap qw(die normal-signals); # Allow cleanup on signals
+
+use strict;
+use warnings;
+
+my %DNS_CACHE = (); # IP to hostname cache
+my @MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+	      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec');
+my @DAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun');
+my $LOG_FD;
+
+################################################################################
+# Logging
+################################################################################
+
+sub log_message {
+    # Print a log message based on the template string
+    my ($options, %message) = @_;
+    my $template = $options->{template};
+    my ($second, $minute, $hour, $day, $month, $year4, $week_day) = localtime(time());
+    my $year2;
+
+    $week_day = $DAYS[$week_day];
+    $month = $MONTHS[$month]; # Set month to the month name
+    $year4 += 1900; # Convert year to 4 digits
+    ($year2) = $year4 =~ /^\d\d(\d\d)$/; # Extract 2 digit year
+
+    if (length($day) == 1) { # Pad dates with spaces to make them alwys 2 characters
+	$day = ' ' . $day;
+    }
+
+    # Pad 'in' with a space to keep the length the same as out
+    if ($message{direction} eq 'in') {
+	$message{direction} = ' in';
+    }
+
+    # Pad Hour/Minute/Second with 0s
+    $hour = sprintf("%02d", $hour);
+    $minute = sprintf("%02d", $minute);
+    $second = sprintf("%02d", $second);
+
+    $template =~ s/\%a/$message{source_ip}/g;
+    $template =~ s/\%A/$message{dest_ip}/g;
+    $template =~ s/\%d/$message{dest_host}/g;
+    $template =~ s/\%D/$message{dest_port}/g;
+    $template =~ s/\%i/$message{direction}/g;
+    $template =~ s/\%p/$message{protocol}/g;
+    $template =~ s/\%s/$message{source_host}/g;
+    $template =~ s/\%S/$message{source_port}/g;
+
+    $template =~ s/\%t/\%M \%T \%h:\%m:\%z/g;
+    $template =~ s/\%M/$month/g;
+    $template =~ s/\%T/$day/g;
+    $template =~ s/\%w/$week_day/g;
+    $template =~ s/\%y/$year2/g;
+    $template =~ s/\%Y/$year4/g;
+
+    $template =~ s/\%h/$hour/g;
+    $template =~ s/\%m/$minute/g;
+    $template =~ s/\%z/$second/g;
+
+    if ($LOG_FD) { # Write to the log file
+	print $LOG_FD "$template\n";
+    }
+
+    if (! $options->{quiet}) { # Write to STDOUT
+	print "$template\n";
+    }
+}
+
+################################################################################
+# Filtering
+################################################################################
+
+sub init_filters {
+    # Setup filters and convert filters ip/host filters into regular expressions
+    my ($options) = @_;
+    my $filter;
+
+    if ($options->{filter_protocol} !~ /^(TCP|UDP)?$/i) {
+	print STDERR "ERROR: filter_protcol: Unknown protocol\n";
+	show_usage();
+    }
+    elsif ($options->{filter_direction} !~ /^(IN|OUT)?$/i) {
+	print STDERR "ERROR: filter_direction: Invalid direction\n";
+	show_usage();
+    }
+
+    $options->{filter_protocol} = uc($options->{filter_protocol});
+    $options->{filter_direction} = lc($options->{filter_direction});
+
+    foreach (keys %$options) {
+	if ($_ =~ /^filter_(ip|host)/ && ($filter = $options->{$_})) {
+	    $filter = quotemeta($filter); # Protect non-word characters
+	    $filter =~ s/\\\*/.*/g; # Replace wildcards with .*
+	    $filter = "^${filter}\$"; # Add beginning/end constraints
+
+	    $options->{$_} = $filter;
+	}
+    }
+}
+
+sub check_filter {
+    # Check a regex filter against 1 or more values
+    # Return 1 if the message should be fitlered, otherwise 0
+    my ($filter) = @_;
+    my $x;
+
+    if (! $filter) { # If the filter isn't set, return 0
+	return (0);
+    }
+
+    for ($x = 1; $x <= $#_; $x++) {
+	my $value = $_[$x];
+
+	if ($value && ($value =~ $filter)) {
+	    return (0);
+	}
+    }
+
+    return (1);
+}
+
+sub filter_message {
+    # Return 1 if the message should be filtered, otherwise 0
+    my ($options, %message) = @_;
+
+    if (($options->{filter_direction} && ($message{direction} ne $options->{filter_direction})) ||
+	($options->{filter_protocol} && ($message{protocol} ne $options->{filter_protocol})) ||
+	check_filter($options->{filter_ip}, $message{source_ip}, $message{dest_ip}) ||
+	check_filter($options->{filter_ip_source}, $message{source_ip}) ||
+	check_filter($options->{filter_ip_dest}, $message{dest_ip}) ||
+	check_filter($options->{filter_host}, $message{source_hostname}, $message{dest_hostname}) ||
+	check_filter($options->{filter_host_source}, $message{source_hostname}) ||
+	check_filter($options->{filter_host_dest}, $message{dest_hostname})) {
+	return (1);
+    }
+
+    return (0);
+}
+
+################################################################################
+# Networking
+################################################################################
+
+sub lookup_ip {
+    # Lookup the host name of an IP Address
+    # Use a cache to prevent lots of repeat requests
+    my ($options, $ip) = @_;
+    my $host;
+
+    if (! $options->{cache_dns}) {
+	return (gethostbyaddr($ip, AF_INET) || '');
+    }
+
+    # TODO: If this is to be used as a long running log, we should
+    #       expire items in the cache to free up memory.
+    if (defined($DNS_CACHE{$ip})) {
+	return ($DNS_CACHE{$ip});
+    }
+    else {
+	$host = gethostbyaddr($ip, AF_INET);
+    }
+
+    if ($host && $host ne $ip) {
+	$DNS_CACHE{$ip} = $host;
+
+	return ($host);
+    }
+    else {
+	$DNS_CACHE{$ip} = '';
+
+	return ('');
+    }
+}
+
+sub create_message_hash {
+    # Based on the $options, create the message hash
+    my ($options, $direction, $protocol, $source_host,
+	$source_ip, $source_port, $dest_host, $dest_ip, $dest_port) = @_;
+    my %message = (
+	direction => $direction,
+	protocol => $protocol,
+	source_ip => $source_ip,
+	dest_ip => $dest_ip
+	);
+
+    # If a filter requires DNS, or it isn't disabled, lookup IP addresses
+    if ($options->{filter_host} || $options->{filter_host_source} ||
+	! $options->{no_dns} || ! $options->{no_dns_source}) {
+	$message{source_hostname} = ($source_host || lookup_ip($options, $source_ip));
+    }
+
+    if ($options->{filter_host} || $options->{filter_host_dest} ||
+	! $options->{no_dns} || ! $options->{no_dns_dest}) {
+	$message{dest_hostname} = ($dest_host || lookup_ip($options, $dest_ip));
+    }
+
+    # Setup the host names for display, unless showing IPs is enabled
+    if (! $options->{no_dns}) {
+	if (! $options->{no_dns_source}) {
+	    $message{source_host} = $message{source_hostname};
+	}
+
+	if (! $options->{no_dns_dest}) {
+	    $message{dest_host} = $message{dest_hostname};
+	}
+    }
+
+    # Set the displayed host to the IP, if it isn't set to a name
+    $message{source_host} ||= $source_ip;
+    $message{dest_host} ||= $dest_ip;
+
+    # Setup the ports for display
+    if (! $options->{show_port_numbers}) {
+	$message{source_port} = getservbyport($source_port, lc($protocol)) || $source_port;
+	$message{dest_port} = getservbyport($dest_port, lc($protocol)) || $dest_port;
+    }
+
+    $message{source_port} ||= $source_port;
+    $message{dest_port} ||= $dest_port;
+
+    return (%message);
+}
+
+sub parse_message {
+    my ($options, $message_buffer) = @_;
+    my ($direction, $protocol, undef, $source_host, $source_ip,
+	$source_port, undef, $dest_host, $dest_ip, $dest_port) =
+	$message_buffer =~ /
+                   \@(in|out)                                   # Direction
+                   \ (UDP|TCP)\ from\                           # Protocol
+                   (([\w\-\.]+)\()?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)? # Dest IP
+                   :(\d{1,6})\ to\                               # Source port
+                   (([\w\-\.]+)\()?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)? # Dest IP
+                   :(\d{1,6})                                   # Dest port
+                   /xs;
+
+    if ($direction) { # Valid messages must have a $direction
+	my %message = create_message_hash($options, $direction, $protocol, $source_host,
+					  $source_ip, $source_port, $dest_host,
+					  $dest_ip, $dest_port);
+
+	if (! filter_message($options, %message)) {
+	    log_message($options, %message);
+	}
+    }
+}
+
+################################################################################
+# Command Line
+################################################################################
+
+sub show_usage {
+    print <<EOF;
+Usage: linklog [OPTIONS]
+  GENERAL:
+    -h, --help                    Show usage information
+    --cache-dns                   Store and reuse results of DNS queries
+    -p, --port={port}             The port to listen on
+    --run-as={user}               After initialization, run as this user
+                                  (default is 'nobody')
+
+  FILTERS:
+      When filters are used, only traffic matching the filters will be shown.
+
+    --filter-direction={IN|OUT}   Limit traffic to only inbound or outbound
+    --filter-ip={filter}          Limit traffic based on the IP address
+    --filter-ip-dest={filter}     Limit traffic based on destination IPs
+    --filter-ip-source={filter}   Limit traffic based on source IPs
+    --filter-host={filter}        Limit traffic based on host names
+    --filter-host-dest={filter}   Limit traffic based on destination host names
+    --filter-host-source={filter} Limit traffic based on sound host names
+    --filter-protocol={TCP|UDP}   Limit traffic to TCP or UDP protocols
+
+  OUTPUT CONTROL:
+    -l, --log-file={filename}     Write all traffic data to a file
+    --no-dns                      Show IPs instead of host names
+    --no-dns-dest                 Show destination IPs instead of host names
+    --no-dns-source               Show source IPs instead of host names
+    -q, --quiet                   Do not display output (used with -l)
+    -s, --show-port-numbers       Show port numbers instead of service names
+    -t, --template={template}     Set the template for displaying traffic.
+                                  Default is: \%t [\%i, \%p] \%s:\%S -> \%d:\%D
+  TEMPLATE TOKENS:
+       \%a - Source IP address           \%s - Source host
+       \%A - Destination IP address      \%S - Source port
+       \%d - Destination host            \%t - Current timestamp
+       \%D - Destination port                 (Same as: \%M \%T \%h:\%m:\%z)
+       \%i - Direction (' in' or 'out')  \%T - Current day
+       \%h - Current hour                \%w - Current day of the week
+       \%m - Current minute              \%y - Current year (4 digit)
+       \%M - Current month               \%Y - Current year (2 digit)
+       \%p - Protocol ('UDP', or 'TCP')  \%z - Current second
+
+  FILTER EXAMPLES:
+       Filters may use * as a wildcard.  For example:
+         *.example.com   Match anything ending with '.example.com'
+         192.168.*       Match anything beginning with '192.168.'
+         10.*.1          Math anything starting with '10.' and ending with '.1'
+
+  NOTE: This program must listen on UDP port 162.  This is a privileged port,
+        and so the program must be executed by the root user or configured to
+        use an unprivileged port.
+EOF
+
+    exit(1);
+}
+
+sub parse_command_line_options {
+    my %options = (
+	cache_dns => 0,
+	filter_direction => '',
+	filter_ip => '',
+	filter_ip_source => '',
+	filter_ip_dest => '',
+	filter_host => '',
+	filter_host_source => '',
+	filter_host_dest => '',
+	filter_protocol => '',
+	help => 0,
+	log_file => '',
+        port => 162,
+	no_dns => 0,
+	no_dns_source => 0,
+	no_dns_dest => 0,
+	quiet => 0,
+	run_as => 'nobody',
+	show_port_numbers => 0,
+	template => '%t [%i, %p] %s:%S -> %d:%D'
+	);
+
+    if (! GetOptions(
+	      "cache-dns"             => \$options{cache_dns},
+	      "filter-direction=s"    => \$options{filter_direction},
+	      "filter-ip=s"           => \$options{filter_ip},
+	      "filter-ip-source=s"    => \$options{filter_ip_source},
+	      "filter-ip-dest=s"      => \$options{filter_ip_dest},
+	      "filter-host=s"         => \$options{filter_host},
+	      "filter-host-source=s"  => \$options{filter_host_source},
+	      "filter-host-dest=s"    => \$options{filter_host_dest},
+	      "filter-protocol=s"     => \$options{filter_protocol},
+  	      "help"                  => \$options{help},
+	      "log-file=s"            => \$options{log_file},
+	      "no-dns"                => \$options{no_dns},
+	      "no-dns-source"         => \$options{no_dns_source},
+	      "no-dns-dest"           => \$options{no_dns_dest},
+	      "port=i"                => \$options{port},
+	      "quiet"                 => \$options{quiet},
+	      "run-as=s"              => \$options{run_as},
+	      "show-port-numbers"     => \$options{show_port_numbers},
+	      "template=s"            => \$options{template},
+	)) {
+	show_usage();
+    }
+
+    if ($#ARGV != -1) {
+	show_usage();
+    }
+
+    if ($options{help}) {
+	show_usage();
+    }
+
+    if ($options{log_file}) {
+	if (! (open($LOG_FD, ">>", $options{log_file}))) {
+	    die("ERROR: Could not open log file for writing '$options{log_file}'\n");
+	}
+    }
+
+    init_filters(\%options);
+
+    return (%options);
+}
+
+################################################################################
+# Initialization
+################################################################################
+
+sub change_user {
+    # If we are root, change to another user
+    my (%options) = @_;
+
+    if (getuid() == 0) {
+	my (undef, undef, $uid) = getpwnam($options{run_as});
+
+	if ($uid) {
+	    setuid($uid);
+	}
+	else {
+	    die ("ERROR: Could not set user to '$options{run_as}'.  Unknown user.\n");
+	}
+    }
+}
+
+sub main {
+    my %options = parse_command_line_options();
+    my $server = IO::Socket::INET->new(
+	Proto => 'udp',
+	LocalPort => $options{port}
+	);
+    my $message;
+
+    if (! $server) {
+	die ("ERROR: UDP bind of port $options{port} failed!\n");
+    }
+
+    change_user(%options);
+
+    while ($server->recv($message, 1024)) {
+	parse_message(\%options, $message);
+    }
+}
+
+main();
+
+END { # Cleanup
+    # If the log file is open, close it
+    if ($LOG_FD) {
+	close($LOG_FD);
+    }
+}
