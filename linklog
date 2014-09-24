@@ -147,7 +147,7 @@ sub init_filters {
 
 sub check_filter {
     # Check a regex filter against 1 or more values
-    # Return 1 if the message should be fitlered, otherwise 0
+    # Return 1 if the message should be filtered, otherwise 0
     my ($filter) = @_;
     my $x;
 
