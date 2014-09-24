@@ -70,7 +70,7 @@ sub log_message {
     $year4 += 1900; # Convert year to 4 digits
     ($year2) = $year4 =~ /^\d\d(\d\d)$/; # Extract 2 digit year
 
-    if (length($day) == 1) { # Pad dates with spaces to make them alwys 2 characters
+    if (length($day) == 1) { # Pad dates with spaces to make them always 2 characters
 	$day = ' ' . $day;
     }
 
